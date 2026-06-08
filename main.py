@@ -161,6 +161,10 @@ if f_token:
         "start_order_date_in": start_date, "end_order_date_in": end_date,
         "page": "1", "limit": "15", "token": f_token, "id": REQUEST_ID
     }, "MTD_Fulfillment", ["Kode Fulfillment", "SKU Produk"])
+else:
+    error_msg = "❌ ERROR: Gagal mendapatkan token Fulfillment. Bearer Token kemungkinan kedaluwarsa!"
+    print(error_msg)
+    update_cache_log("MTD_Fulfillment", "Failed (Token Expired)")
 
 # --- DELIVERY ---
 d_token = get_fresh_export_token()
@@ -170,6 +174,10 @@ if d_token:
         "startDate": start_date, "endDate": end_date, "updateStatus": "false",
         "token": d_token, "id": REQUEST_ID
     }, "MTD_Delivery", ["Kode Pengiriman", "SKU Produk"])
+else:
+    error_msg = "❌ ERROR: Gagal mendapatkan token Delivery. Bearer Token kemungkinan kedaluwarsa!"
+    print(error_msg)
+    update_cache_log("MTD_Delivery", "Failed (Token Expired)")
 
 # --- RETURNS ---
 r_token = get_fresh_export_token()
@@ -179,5 +187,9 @@ if r_token:
         "startDate": start_date, "endDate": end_date,
         "token": r_token, "id": REQUEST_ID
     }, "MTD_Returns", ["Kode Fulfillment", "Kode SKU"])
+else:
+    error_msg = "❌ ERROR: Gagal mendapatkan token Returns. Bearer Token kemungkinan kedaluwarsa!"
+    print(error_msg)
+    update_cache_log("MTD_Returns", "Failed (Token Expired)")
 
 print("🎉 SINKRONISASI TUNTAS 100%.")
