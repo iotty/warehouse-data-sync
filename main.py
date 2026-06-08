@@ -98,35 +98,38 @@ def fetch_upsert_and_push(export_url, params, tab_name, unique_keys):
     
     response = requests.get(export_url, headers=HEADERS, params=params)
     if response.status_code != 200:
-        error_msg = f"❌ Error {response.status_code}: Gagal menarik data."
-        print(error_msg)
-        update_cache_log(tab_name, error_msg)
+        print(f"❌ Error {response.status_code}: Gagal menarik data.")
+        # STANDAR LOG 1: FAILED (API)
+        update_cache_log(tab_name, f"Failed (API Error {response.status_code})")
         return
         
     df_fresh = pd.read_excel(io.BytesIO(response.content))
     if df_fresh.empty:
-        msg = "⚠️ Tidak ada data baru untuk periode ini."
-        print(msg + "\n")
-        update_cache_log(tab_name, msg)
+        print("⚠️ Tidak ada data baru untuk periode ini.\n")
+        # STANDAR LOG 2: SUCCESSFUL (KOSONG) - Tetap dicatat di Cache_Data
+        update_cache_log(tab_name, "Successful (No New Data)")
         return
 
     try:
         worksheet = gc.open_by_key(SPREADSHEET_ID).worksheet(tab_name)
     except gspread.exceptions.WorksheetNotFound:
         print(f"❌ Tab '{tab_name}' tidak ditemukan di Google Sheets.\n")
+        # STANDAR LOG 3: FAILED (TAB HILANG)
+        update_cache_log(tab_name, "Failed (Schema Error - Tab Missing)")
         return
 
     existing_df = get_as_dataframe(worksheet).dropna(how='all').dropna(axis=1, how='all')
     
     if existing_df.empty:
         final_df = df_fresh
-        print(f"Inisialisasi awal, {len(final_df)} baris disiapkan.")
+        updated_rows = len(final_df)
+        print(f"Inisialisasi awal, {updated_rows} baris disiapkan.")
     else:
         missing_cols = [col for col in unique_keys if col not in df_fresh.columns or col not in existing_df.columns]
         if missing_cols:
-            error_msg = f"❌ ERROR KRITIS: Kolom unik {missing_cols} tidak ditemukan di Sheet/API."
-            print(error_msg)
-            update_cache_log(tab_name, error_msg)
+            print(f"❌ ERROR KRITIS: Kolom unik {missing_cols} tidak ditemukan di Sheet/API.")
+            # STANDAR LOG 4: FAILED (KOLOM BERUBAH)
+            update_cache_log(tab_name, "Failed (Schema Error - Missing Columns)")
             return
 
         existing_headers = existing_df.columns.tolist()
@@ -139,11 +142,10 @@ def fetch_upsert_and_push(export_url, params, tab_name, unique_keys):
 
     worksheet.clear()
     set_with_dataframe(worksheet, final_df)
-    success_msg = "✅ Berhasil Diperbarui"
-    print(f"{success_msg}!\n")
+    print("✅ Berhasil Diperbarui!\n")
     
-    # Trigger Cache Log Update
-    update_cache_log(tab_name, success_msg)
+    # STANDAR LOG 5: SUCCESSFUL (Berhasil diproses)
+    update_cache_log(tab_name, "Successful")
 
 
 # ==========================================
