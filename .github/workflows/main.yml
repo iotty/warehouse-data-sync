@@ -2,9 +2,9 @@ name: Data Sync Pipeline (Fresh Factory to Google Sheets)
 
 on:
   schedule:
-    # Waktu UTC. Ini setara dengan jam 08:00, 13:00, 17:00, dan 20:00 WIB
-    - cron: '0 1,6,10,13 * * *'
-  workflow_dispatch: # Mengizinkan Anda menekan tombol 'Run' secara manual di GitHub
+    # Waktu UTC. Setara dengan jam 07:00, 10:00, 13:00, 17:00, dan 20:00 WIB
+    - cron: '0 0,3,6,10,13 * * *'
+  workflow_dispatch:
 
 jobs:
   upsert_job:
