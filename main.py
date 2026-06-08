@@ -6,6 +6,7 @@ import requests
 import io
 import time
 from datetime import datetime, timedelta
+import pytz
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread_dataframe import set_with_dataframe, get_as_dataframe
 
@@ -50,7 +51,7 @@ print(f"🔄 Menjalankan Rolling Window: {start_date} s/d {end_date}\n")
 # ==========================================
 def get_fresh_export_token():
     url = "https://api.freshfactory.id/v1/admin/exports/generate_token"
-    for _ in range(3): # Coba 3x jika gagal
+    for _ in range(3): 
         try:
             response = requests.get(url, headers=HEADERS)
             if response.status_code == 200:
@@ -60,18 +61,53 @@ def get_fresh_export_token():
         time.sleep(2)
     return None
 
+def update_cache_log(category_name, status_message):
+    try:
+        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+        try:
+            cache_sheet = spreadsheet.worksheet("Cache_Data")
+        except gspread.exceptions.WorksheetNotFound:
+            print("Membuat tab Cache_Data baru...")
+            cache_sheet = spreadsheet.add_worksheet(title="Cache_Data", rows="100", cols="3")
+            cache_sheet.append_row(["Kategori", "Terakhir Update (WIB)", "Status Eksekusi Terakhir"])
+        
+        # Konversi waktu ke WIB (Waktu Indonesia Barat)
+        wib_tz = pytz.timezone('Asia/Jakarta')
+        current_time_wib = datetime.now(wib_tz).strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Cari baris yang sesuai dengan kategori
+        existing_data = cache_sheet.get_all_values()
+        row_index = -1
+        for i, row in enumerate(existing_data):
+            if row and row[0] == category_name:
+                row_index = i + 1 
+                break
+                
+        if row_index != -1:
+            # Update baris yang ada
+            cache_sheet.update(f'B{row_index}:C{row_index}', [[current_time_wib, status_message]])
+        else:
+            # Tambahkan baris baru jika belum ada
+            cache_sheet.append_row([category_name, current_time_wib, status_message])
+            
+    except Exception as e:
+         print(f"⚠️ Peringatan: Gagal memperbarui Cache_Data: {e}")
+
 def fetch_upsert_and_push(export_url, params, tab_name, unique_keys):
     print(f"--- Memproses {tab_name} ---")
     
-    # Menarik data menggunakan param dictionary agar URL aman
     response = requests.get(export_url, headers=HEADERS, params=params)
     if response.status_code != 200:
-        print(f"❌ Error {response.status_code}: Gagal menarik data. Respons: {response.text}")
+        error_msg = f"❌ Error {response.status_code}: Gagal menarik data."
+        print(error_msg)
+        update_cache_log(tab_name, error_msg)
         return
         
     df_fresh = pd.read_excel(io.BytesIO(response.content))
     if df_fresh.empty:
-        print("⚠️ Tidak ada data baru untuk periode ini.\n")
+        msg = "⚠️ Tidak ada data baru untuk periode ini."
+        print(msg + "\n")
+        update_cache_log(tab_name, msg)
         return
 
     try:
@@ -80,37 +116,35 @@ def fetch_upsert_and_push(export_url, params, tab_name, unique_keys):
         print(f"❌ Tab '{tab_name}' tidak ditemukan di Google Sheets.\n")
         return
 
-    # Menarik data dari Sheet menggunakan gspread_dataframe (lebih cepat & bersih)
     existing_df = get_as_dataframe(worksheet).dropna(how='all').dropna(axis=1, how='all')
     
     if existing_df.empty:
         final_df = df_fresh
         print(f"Inisialisasi awal, {len(final_df)} baris disiapkan.")
     else:
-        # Pengecekan Composite Keys
         missing_cols = [col for col in unique_keys if col not in df_fresh.columns or col not in existing_df.columns]
         if missing_cols:
-            print(f"❌ ERROR KRITIS: Kolom unik {missing_cols} tidak ditemukan di Sheet/API.")
+            error_msg = f"❌ ERROR KRITIS: Kolom unik {missing_cols} tidak ditemukan di Sheet/API."
+            print(error_msg)
+            update_cache_log(tab_name, error_msg)
             return
 
-        # Simpan struktur header asli milik Google Sheet untuk merapikan urutan
         existing_headers = existing_df.columns.tolist()
-
-        # Proses Penggabungan & Deduplikasi (Upsert)
         combined_df = pd.concat([existing_df, df_fresh], ignore_index=True)
         final_df = combined_df.drop_duplicates(subset=unique_keys, keep='last')
-        
-        # --- FITUR KESELAMATAN KOLOM ---
-        # Memaksa data baru mengikuti urutan nama kolom yang sudah ada di Sheet
         final_df = final_df.reindex(columns=existing_headers)
         
         updated_rows = len(final_df) - len(existing_df)
         print(f"Upsert & Column Mapping selesai. Penambahan bersih: {updated_rows} baris.")
 
-    # Membersihkan dan memasukkan DataFrame secara otomatis dengan gspread_dataframe
     worksheet.clear()
     set_with_dataframe(worksheet, final_df)
-    print(f"✅ Data {tab_name} berhasil di-push sesuai format kolom!\n")
+    success_msg = "✅ Berhasil Diperbarui"
+    print(f"{success_msg}!\n")
+    
+    # Trigger Cache Log Update
+    update_cache_log(tab_name, success_msg)
+
 
 # ==========================================
 # 4. EKSEKUSI PIPELINE (TOKEN-PER-REQUEST)
