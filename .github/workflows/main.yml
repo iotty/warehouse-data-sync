@@ -1,0 +1,29 @@
+name: Data Sync Pipeline (Fresh Factory to Google Sheets)
+
+on:
+  schedule:
+    # Waktu UTC. Ini setara dengan jam 08:00, 13:00, 17:00, dan 20:00 WIB
+    - cron: '0 1,6,10,13 * * *'
+  workflow_dispatch: # Mengizinkan Anda menekan tombol 'Run' secara manual di GitHub
+
+jobs:
+  upsert_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ambil Kode dari Repository
+        uses: actions/checkout@v3
+
+      - name: Siapkan Environment Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Pustaka (Library)
+        run: pip install -r requirements.txt
+
+      - name: Jalankan Skrip Upsert Harian
+        env:
+          # Memanggil data rahasia dari tab Settings > Secrets
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
+        run: python main.py
