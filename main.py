@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta
 import pytz
 from oauth2client.service_account import ServiceAccountCredentials
-from gspread_dataframe import set_with_dataframe, get_as_dataframe
+from gspread_dataframe import set_with_dataframe
 
 # ==========================================
 # 1. KONFIGURASI KEAMANAN & KREDENSIAL
@@ -93,7 +93,7 @@ def update_cache_log(category_name, status_message):
     except Exception as e:
          print(f"⚠️ Peringatan: Gagal memperbarui Cache_Data: {e}")
 
-def fetch_upsert_and_push(export_url, params, tab_name, unique_keys):
+def fetch_and_replace(export_url, params, tab_name):
     print(f"--- Memproses {tab_name} ---")
     
     response = requests.get(export_url, headers=HEADERS, params=params)
@@ -118,31 +118,31 @@ def fetch_upsert_and_push(export_url, params, tab_name, unique_keys):
         update_cache_log(tab_name, "Failed (Schema Error - Tab Missing)")
         return
 
-    existing_df = get_as_dataframe(worksheet).dropna(how='all').dropna(axis=1, how='all')
-    
-    if existing_df.empty:
-        final_df = df_fresh
-        updated_rows = len(final_df)
-        print(f"Inisialisasi awal, {updated_rows} baris disiapkan.")
+    # Ambil header yang sudah ada di baris pertama sheet, agar header selalu dipertahankan
+    existing_header = [h for h in worksheet.row_values(1) if h != ""]
+
+    if existing_header:
+        # Cocokkan kolom sumber (API) dengan header sheet berdasarkan NAMA, fleksibel terhadap
+        # perubahan urutan/jumlah kolom di sumber:
+        #  - Header yang namanya cocok dengan sumber -> diisi datanya
+        #  - Header yang tidak ada di sumber -> tetap ada di sheet, tapi datanya kosong
+        #  - Kolom sumber yang tidak ada di header -> diabaikan (tidak ditulis)
+        matched_cols = [c for c in existing_header if c in df_fresh.columns]
+        unmatched_cols = [c for c in existing_header if c not in df_fresh.columns]
+        if unmatched_cols:
+            print(f"ℹ️ Header tanpa kecocokan di sumber (dikosongkan): {unmatched_cols}")
+        print(f"Kolom tercocokkan: {len(matched_cols)}/{len(existing_header)}")
+
+        df_to_write = df_fresh.reindex(columns=existing_header)
     else:
-        missing_cols = [col for col in unique_keys if col not in df_fresh.columns or col not in existing_df.columns]
-        if missing_cols:
-            print(f"❌ ERROR KRITIS: Kolom unik {missing_cols} tidak ditemukan di Sheet/API.")
-            # STANDAR LOG 4: FAILED (KOLOM BERUBAH)
-            update_cache_log(tab_name, "Failed (Schema Error - Missing Columns)")
-            return
+        # Sheet/tab masih kosong -> pakai header dari sumber sebagai inisialisasi awal
+        print("Header sheet kosong, menggunakan header dari sumber sebagai inisialisasi.")
+        df_to_write = df_fresh
 
-        existing_headers = existing_df.columns.tolist()
-        combined_df = pd.concat([existing_df, df_fresh], ignore_index=True)
-        final_df = combined_df.drop_duplicates(subset=unique_keys, keep='last')
-        final_df = final_df.reindex(columns=existing_headers)
-        
-        updated_rows = len(final_df) - len(existing_df)
-        print(f"Upsert & Column Mapping selesai. Penambahan bersih: {updated_rows} baris.")
-
+    # Clear & paste, tapi header selalu dipertahankan/di-set ulang sesuai df_to_write.columns
     worksheet.clear()
-    set_with_dataframe(worksheet, final_df)
-    print("✅ Berhasil Diperbarui!\n")
+    set_with_dataframe(worksheet, df_to_write)
+    print(f"✅ Berhasil Diperbarui! Header dipertahankan, {len(df_to_write)} baris data ditulis.\n")
     
     # STANDAR LOG 5: SUCCESSFUL (Berhasil diproses)
     update_cache_log(tab_name, "Successful")
@@ -156,11 +156,11 @@ export_url = "https://api.freshfactory.id/v1/admin/exports"
 # --- FULFILLMENT ---
 f_token = get_fresh_export_token()
 if f_token:
-    fetch_upsert_and_push(export_url, {
+    fetch_and_replace(export_url, {
         "type": "fulfillment_detail", "warehouse_id": WAREHOUSE_ID, "tenant_id": TENANT_ID,
         "start_order_date_in": start_date, "end_order_date_in": end_date,
         "page": "1", "limit": "15", "token": f_token, "id": REQUEST_ID
-    }, "MTD_Fulfillment", ["Kode Fulfillment", "SKU Produk"])
+    }, "MTD_Fulfillment")
 else:
     error_msg = "❌ ERROR: Gagal mendapatkan token Fulfillment. Bearer Token kemungkinan kedaluwarsa!"
     print(error_msg)
@@ -169,11 +169,11 @@ else:
 # --- DELIVERY ---
 d_token = get_fresh_export_token()
 if d_token:
-    fetch_upsert_and_push(export_url, {
+    fetch_and_replace(export_url, {
         "type": "delivery", "warehouseId": WAREHOUSE_ID, "tenantId": TENANT_ID,
         "startDate": start_date, "endDate": end_date, "updateStatus": "false",
         "token": d_token, "id": REQUEST_ID
-    }, "MTD_Delivery", ["Kode Pengiriman", "SKU Produk"])
+    }, "MTD_Delivery")
 else:
     error_msg = "❌ ERROR: Gagal mendapatkan token Delivery. Bearer Token kemungkinan kedaluwarsa!"
     print(error_msg)
@@ -182,11 +182,11 @@ else:
 # --- RETURNS ---
 r_token = get_fresh_export_token()
 if r_token:
-    fetch_upsert_and_push(export_url, {
+    fetch_and_replace(export_url, {
         "type": "return", "warehouseId": WAREHOUSE_ID, "tenantId": TENANT_ID,
         "startDate": start_date, "endDate": end_date,
         "token": r_token, "id": REQUEST_ID
-    }, "MTD_Returns", ["Kode Fulfillment", "Kode SKU"])
+    }, "MTD_Returns")
 else:
     error_msg = "❌ ERROR: Gagal mendapatkan token Returns. Bearer Token kemungkinan kedaluwarsa!"
     print(error_msg)
