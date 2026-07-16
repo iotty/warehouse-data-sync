@@ -46,6 +46,34 @@ start_date = first_day_last_month.strftime('%Y-%m-%d')
 
 print(f"🔄 Menjalankan Rolling Window: {start_date} s/d {end_date}\n")
 
+# Header baku untuk MTD_Fulfillment. Hanya kolom dengan nama yang cocok
+# persis dengan daftar ini yang akan disalin dari sumber ke Google Sheets.
+FULFILLMENT_HEADER = [
+    "Nama Penyewa", "SKU Produk", "Nama Produk", "Type Produk", "Jumlah Pesanan",
+    "UoM", "Jumlah IKU", "Jumlah BKU", "Harga Satuan", "Subtotal",
+    "Tempat Penyimpanan", "Gudang Fisik", "Kode Fulfillment", "Invoice Platform",
+    "Platform", "Nama Pemesan", "Alamat Pemesan", "Kecamatan Pemesan",
+    "Kabupaten/Kota Pemesan", "No. Telp Pemesan", "Nama Penerima", "Alamat Penerima",
+    "Kecamatan Penerima", "Kabupaten/Kota Penerima", "Latitude Penerima",
+    "Longitude Penerima", "No. Telp Penerima", "Catatan", "Estimasi Berat (Kg)",
+    "Estimasi Volume (cm3)", "Jumlah Koli", "Metode Pengantaran", "Kurir Pengantaran",
+    "Tipe Pengantaran", "Nomor AWB", "Nama Kurir", "Tanggal Perkiraan Pickup",
+    "Jam Perkiraan Pickup", "Status Fulfillment", "Alasan Fulfillment",
+    "Tingkat Layanan Fulfillment", "Tanggal Fulfillment Masuk FF",
+    "Jam Fulfillment Masuk FF", "Tanggal Fulfillment Allocated",
+    "Jam Fulfillment Allocated", "Tanggal Batas Waktu", "Jam Batas Waktu",
+    "Tanggal Proses Fulfillment", "Jam Proses Fulfillment", "Nama LM yang Proses",
+    "Tanggal Fulfillment Menunggu Diambil", "Jam Fulfillment Menunggu Diambil",
+    "Nama LM Menunggu Diambil", "Tanggal Fulfillment di Handover",
+    "Jam Fulfillment di Handover", "Nama LM yang Handover", "Tanggal Live Resi",
+    "Jam Live Resi", "Tanggal Ekspedisi Terkirim", "Jam Ekspedisi Terkirim",
+    "Tanggal P-POD Diterima", "Jam P-POD Diterima", "Nama LM yang Menerima P-POD",
+    "Tanggal Fulfillment Permintaan Dibatalkan", "Jam Fulfillment Permintaan Dibatalkan",
+    "Nama Requestor Permintaan Dibatalkan", "Tanggal Fulfillment Dibatalkan",
+    "Jam Fulfillment Dibatalkan", "Nama LM Proses Pembatalan Fulfillment",
+    "Status Omni Channel"
+]
+
 # ==========================================
 # 3. FUNGSI BANTUAN (HELPER)
 # ==========================================
@@ -93,7 +121,7 @@ def update_cache_log(category_name, status_message):
     except Exception as e:
          print(f"⚠️ Peringatan: Gagal memperbarui Cache_Data: {e}")
 
-def fetch_and_replace(export_url, params, tab_name):
+def fetch_and_replace(export_url, params, tab_name, fixed_header=None):
     print(f"--- Memproses {tab_name} ---")
     
     response = requests.get(export_url, headers=HEADERS, params=params)
@@ -118,8 +146,13 @@ def fetch_and_replace(export_url, params, tab_name):
         update_cache_log(tab_name, "Failed (Schema Error - Tab Missing)")
         return
 
-    # Ambil header yang sudah ada di baris pertama sheet, agar header selalu dipertahankan
-    existing_header = [h for h in worksheet.row_values(1) if h != ""]
+    if fixed_header is not None:
+        # Header baku ditentukan secara eksplisit (mis. MTD_Fulfillment), tidak
+        # bergantung pada header yang saat ini ada di sheet.
+        existing_header = fixed_header
+    else:
+        # Ambil header yang sudah ada di baris pertama sheet, agar header selalu dipertahankan
+        existing_header = [h for h in worksheet.row_values(1) if h != ""]
 
     if existing_header:
         # Cocokkan kolom sumber (API) dengan header sheet berdasarkan NAMA, fleksibel terhadap
@@ -160,7 +193,7 @@ if f_token:
         "type": "fulfillment_detail", "warehouse_id": WAREHOUSE_ID, "tenant_id": TENANT_ID,
         "start_order_date_in": start_date, "end_order_date_in": end_date,
         "page": "1", "limit": "15", "token": f_token, "id": REQUEST_ID
-    }, "MTD_Fulfillment")
+    }, "MTD_Fulfillment", fixed_header=FULFILLMENT_HEADER)
 else:
     error_msg = "❌ ERROR: Gagal mendapatkan token Fulfillment. Bearer Token kemungkinan kedaluwarsa!"
     print(error_msg)
