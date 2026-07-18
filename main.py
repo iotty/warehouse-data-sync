@@ -74,6 +74,19 @@ FULFILLMENT_HEADER = [
     "Status Omni Channel"
 ]
 
+# Header baku untuk MTD_Returns. Hanya kolom dengan nama yang cocok
+# persis dengan daftar ini yang akan disalin dari sumber ke Google Sheets.
+RETURNS_HEADER = [
+    "Kode Pengembalian", "Kode Fulfillment", "Booking ID Pengembalian", "Nama Penyewa",
+    "Tempat Penyimpanan", "Status Pengembalian", "Kode SKU", "Nama Produk",
+    "Kode IKU", "Kode BKU", "Loker/Bin", "Pallet Loker/Bin", "Status IKU/BKU",
+    "Pengembalian Didaftar", "Didaftarkan Oleh", "Pengembalian Diminta",
+    "Pengembalian Diterima", "Diterima Oleh", "Pengembalian Diproses", "Diproses Oleh",
+    "Pengembalian Selesai", "Diselesaikan Oleh", "Penyatuan", "Disatukan Oleh",
+    "Dibatalkan", "Tipe Pengembalian", "Alasan Pengembalian", "Catatan Penerima",
+    "Kurir Pengantaran Fulfillment", "Tipe Pengantaran Fulfillment"
+]
+
 # ==========================================
 # 3. FUNGSI BANTUAN (HELPER)
 # ==========================================
@@ -219,7 +232,7 @@ if r_token:
         "type": "return", "warehouseId": WAREHOUSE_ID, "tenantId": TENANT_ID,
         "startDate": start_date, "endDate": end_date,
         "token": r_token, "id": REQUEST_ID
-    }, "MTD_Returns")
+    }, "MTD_Returns", fixed_header=RETURNS_HEADER)
 else:
     error_msg = "❌ ERROR: Gagal mendapatkan token Returns. Bearer Token kemungkinan kedaluwarsa!"
     print(error_msg)
