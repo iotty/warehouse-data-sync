@@ -1,27 +1,72 @@
 import os
+import sys
 import json
 import gspread
 import pandas as pd
 import requests
 import io
 import time
+import traceback
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread_dataframe import set_with_dataframe
 
+REQUEST_TIMEOUT = 30  # detik, dipakai untuk semua panggilan HTTP (mencegah hang tanpa batas di CI)
+
 # ==========================================
 # 1. KONFIGURASI KEAMANAN & KREDENSIAL
 # ==========================================
-bearer_token = os.environ['BEARER_TOKEN']
-service_account_info = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT'])
+def load_config():
+    """
+    Validasi environment variables & inisialisasi client di awal, dengan
+    pesan error yang jelas. Kalau ada yang salah di sini, script berhenti
+    SEKARANG dengan pesan yang bisa langsung dibaca dari log CI, bukan
+    traceback KeyError/JSONDecodeError yang membingungkan.
+    """
+    bearer_token = os.environ.get('BEARER_TOKEN')
+    if not bearer_token:
+        print("❌ FATAL: Environment variable 'BEARER_TOKEN' tidak ditemukan / kosong.")
+        sys.exit(1)
 
-with open('credentials.json', 'w') as f:
-    json.dump(service_account_info, f)
+    raw_service_account = os.environ.get('GOOGLE_SERVICE_ACCOUNT')
+    if not raw_service_account:
+        print("❌ FATAL: Environment variable 'GOOGLE_SERVICE_ACCOUNT' tidak ditemukan / kosong.")
+        sys.exit(1)
 
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
-gc = gspread.authorize(creds)
+    try:
+        service_account_info = json.loads(raw_service_account)
+    except json.JSONDecodeError as e:
+        print(f"❌ FATAL: 'GOOGLE_SERVICE_ACCOUNT' bukan JSON yang valid: {e}")
+        sys.exit(1)
+
+    creds_path = 'credentials.json'
+    try:
+        with open(creds_path, 'w') as f:
+            json.dump(service_account_info, f)
+    except OSError as e:
+        print(f"❌ FATAL: Gagal menulis file kredensial sementara: {e}")
+        sys.exit(1)
+
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, scope)
+        gc = gspread.authorize(creds)
+    except Exception as e:
+        print(f"❌ FATAL: Gagal autentikasi ke Google Sheets. Periksa isi GOOGLE_SERVICE_ACCOUNT.\nDetail: {e}")
+        sys.exit(1)
+    finally:
+        # Jangan tinggalkan kredensial di disk lebih lama dari yang perlu.
+        try:
+            os.remove(creds_path)
+        except OSError:
+            pass
+
+    return bearer_token, gc
+
+
+bearer_token, gc = load_config()
 
 SPREADSHEET_ID = '1XxA_LgepJhqjoPFx5bZNIp0J57ss_uhqjNk6uxs9cYU'
 WAREHOUSE_ID = "7cc6cf47-973c-485c-b605-0e2ae40ec1d6"
@@ -33,6 +78,26 @@ HEADERS = {
     "authorization": f"Bearer {bearer_token}",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
+
+# Buka spreadsheet SEKALI dan reuse handle-nya di seluruh script. Kalau gagal
+# di sini (spreadsheet dihapus/permission dicabut/id salah), tidak ada
+# gunanya melanjutkan sama sekali -> fatal, exit jelas.
+try:
+    SPREADSHEET = gc.open_by_key(SPREADSHEET_ID)
+except gspread.exceptions.SpreadsheetNotFound:
+    print(f"❌ FATAL: Spreadsheet dengan ID '{SPREADSHEET_ID}' tidak ditemukan atau service account tidak punya akses.")
+    sys.exit(1)
+except gspread.exceptions.APIError as e:
+    print(f"❌ FATAL: Gagal membuka spreadsheet (Google Sheets API error): {e}")
+    sys.exit(1)
+except Exception as e:
+    print(f"❌ FATAL: Gagal membuka spreadsheet karena error tak terduga: {e}")
+    sys.exit(1)
+
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update(HEADERS)
+
+EXPORT_URL = "https://api.freshfactory.id/v1/admin/exports"
 
 # ==========================================
 # 2. LOGIKA ROLLING WINDOW (1 Bulan Lalu - Besok)
@@ -46,8 +111,6 @@ start_date = first_day_last_month.strftime('%Y-%m-%d')
 
 print(f"🔄 Menjalankan Rolling Window: {start_date} s/d {end_date}\n")
 
-# Header baku untuk MTD_Fulfillment. Hanya kolom dengan nama yang cocok
-# persis dengan daftar ini yang akan disalin dari sumber ke Google Sheets.
 FULFILLMENT_HEADER = [
     "Nama Penyewa", "SKU Produk", "Nama Produk", "Type Produk", "Jumlah Pesanan",
     "UoM", "Jumlah IKU", "Jumlah BKU", "Harga Satuan", "Subtotal",
@@ -74,8 +137,6 @@ FULFILLMENT_HEADER = [
     "Status Omni Channel"
 ]
 
-# Header baku untuk MTD_Returns. Hanya kolom dengan nama yang cocok
-# persis dengan daftar ini yang akan disalin dari sumber ke Google Sheets.
 RETURNS_HEADER = [
     "Kode Pengembalian", "Kode Fulfillment", "Booking ID Pengembalian", "Nama Penyewa",
     "Tempat Penyimpanan", "Status Pengembalian", "Kode SKU", "Nama Produk",
@@ -87,52 +148,106 @@ RETURNS_HEADER = [
     "Kurir Pengantaran Fulfillment", "Tipe Pengantaran Fulfillment"
 ]
 
+JOBS = [
+    {
+        "tab_name": "MTD_Fulfillment",
+        "fixed_header": FULFILLMENT_HEADER,
+        "params": {
+            "type": "fulfillment_detail", "warehouse_id": WAREHOUSE_ID, "tenant_id": TENANT_ID,
+            "start_order_date_in": start_date, "end_order_date_in": end_date,
+            "page": "1", "limit": "15",
+        },
+    },
+    {
+        "tab_name": "MTD_Delivery",
+        "fixed_header": None,
+        "params": {
+            "type": "delivery", "warehouseId": WAREHOUSE_ID, "tenantId": TENANT_ID,
+            "startDate": start_date, "endDate": end_date, "updateStatus": "false",
+        },
+    },
+    {
+        "tab_name": "MTD_Returns",
+        "fixed_header": RETURNS_HEADER,
+        "params": {
+            "type": "return", "warehouseId": WAREHOUSE_ID, "tenantId": TENANT_ID,
+            "startDate": start_date, "endDate": end_date,
+        },
+    },
+]
+
 # ==========================================
 # 3. FUNGSI BANTUAN (HELPER)
 # ==========================================
 def get_fresh_export_token():
+    """
+    Ambil token export. Membedakan 3 kelas error secara eksplisit:
+    - Timeout / koneksi putus -> retry
+    - HTTP non-200 -> retry (token generation kadang flaky)
+    - Response 200 tapi bukan JSON valid / field 'exportToken' hilang -> retry juga,
+      karena ini biasanya indikasi respons error/HTML dari sisi server, bukan bug kita.
+    Return None kalau ke-3 percobaan tetap gagal (dianggap "token expired/invalid").
+    """
     url = "https://api.freshfactory.id/v1/admin/exports/generate_token"
-    for _ in range(3):
+    last_error = None
+
+    for attempt in range(1, 4):
         try:
-            response = requests.get(url, headers=HEADERS)
+            response = HTTP_SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.Timeout:
+            last_error = "timeout"
+        except requests.exceptions.RequestException as e:
+            last_error = f"connection error ({e})"
+        else:
             if response.status_code == 200:
-                return response.json().get('data', {}).get('exportToken')
-        except Exception:
-            pass
-        time.sleep(2)
+                try:
+                    token = response.json().get('data', {}).get('exportToken')
+                except (ValueError, AttributeError):
+                    token = None
+                if token:
+                    return token
+                last_error = "response 200 tapi tidak berisi exportToken (kemungkinan payload tidak terduga)"
+            else:
+                last_error = f"HTTP {response.status_code}"
+
+        if attempt < 3:
+            time.sleep(2)
+
+    print(f"⚠️ Gagal mendapatkan export token setelah 3 percobaan. Error terakhir: {last_error}")
     return None
 
+
 def update_cache_log(category_name, status_message):
+    """
+    Catat status eksekusi ke tab Cache_Data. Fungsi ini SENGAJA tidak pernah
+    melempar exception ke pemanggilnya -- kegagalan logging tidak boleh
+    menggagalkan pipeline utama. Semua error di sini hanya dicetak sebagai
+    peringatan.
+    """
     try:
-        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
         try:
-            cache_sheet = spreadsheet.worksheet("Cache_Data")
+            cache_sheet = SPREADSHEET.worksheet("Cache_Data")
         except gspread.exceptions.WorksheetNotFound:
             print("Membuat tab Cache_Data baru...")
-            cache_sheet = spreadsheet.add_worksheet(title="Cache_Data", rows="100", cols="3")
+            cache_sheet = SPREADSHEET.add_worksheet(title="Cache_Data", rows="100", cols="3")
             cache_sheet.append_row(["Kategori", "Terakhir Update (WIB)", "Status Eksekusi Terakhir"])
 
-        # Konversi waktu ke WIB (Waktu Indonesia Barat)
         wib_tz = pytz.timezone('Asia/Jakarta')
         current_time_wib = datetime.now(wib_tz).strftime('%Y-%m-%d %H:%M:%S')
 
-        # Cari baris yang sesuai dengan kategori
-        existing_data = cache_sheet.get_all_values()
-        row_index = -1
-        for i, row in enumerate(existing_data):
-            if row and row[0] == category_name:
-                row_index = i + 1
-                break
+        try:
+            cell = cache_sheet.find(category_name, in_column=1)
+        except gspread.exceptions.CellNotFound:
+            cell = None
 
-        if row_index != -1:
-            # Update baris yang ada
-            cache_sheet.update(f'B{row_index}:C{row_index}', [[current_time_wib, status_message]])
+        if cell is not None:
+            cache_sheet.update(f'B{cell.row}:C{cell.row}', [[current_time_wib, status_message]])
         else:
-            # Tambahkan baris baru jika belum ada
             cache_sheet.append_row([category_name, current_time_wib, status_message])
 
-    except Exception as e:
-         print(f"⚠️ Peringatan: Gagal memperbarui Cache_Data: {e}")
+    except Exception:
+        print(f"⚠️ Peringatan: Gagal memperbarui Cache_Data untuk '{category_name}':")
+        print(traceback.format_exc())
 
 
 def sanitize_dataframe_for_sheets(df):
@@ -142,7 +257,6 @@ def sanitize_dataframe_for_sheets(df):
     - inf/-inf -> string kosong ('')
     - Timestamp/datetime -> string 'YYYY-MM-DD' atau 'YYYY-MM-DD HH:MM:SS'
     - Semua kolom lain dipaksa jadi string agar tidak ada objek non-JSON-serializable
-      (Timestamp mentah dari pandas adalah penyebab umum error [500] saat set_with_dataframe)
     """
     df = df.copy()
 
@@ -155,15 +269,10 @@ def sanitize_dataframe_for_sheets(df):
                 )
             )
         else:
-            # Ganti inf/-inf jadi NaN dulu supaya tertangkap oleh fillna di bawah
             df[col] = df[col].replace([float('inf'), float('-inf')], pd.NA)
 
-    # Ganti semua NaN/NaT/None yang tersisa jadi string kosong
     df = df.fillna('')
-
-    # Paksa semua jadi string biar aman untuk JSON payload Sheets API
     df = df.astype(str)
-    # astype(str) kadang menghasilkan literal 'nan'/'NaT'/'None' pada sel tertentu -> bersihkan
     df = df.replace(['nan', 'NaT', 'None', '<NA>'], '')
 
     return df
@@ -171,9 +280,10 @@ def sanitize_dataframe_for_sheets(df):
 
 def write_with_retry(worksheet, df_to_write, max_retries=4, base_delay=3):
     """
-    Tulis DataFrame ke worksheet dengan retry + exponential backoff.
-    Menangani error transient Google Sheets API seperti [500] Internal error,
-    [502]/[503] Service Unavailable, dan [429] Rate Limit Exceeded.
+    Tulis DataFrame ke worksheet dengan retry + exponential backoff untuk
+    error transient Google Sheets API: [500], [502], [503], [429].
+    Error lain (permission, invalid range, dsb.) langsung dilempar ulang,
+    tidak ada gunanya diulang.
     """
     last_error = None
     for attempt in range(1, max_retries + 1):
@@ -195,127 +305,185 @@ def write_with_retry(worksheet, df_to_write, max_retries=4, base_delay=3):
                 time.sleep(delay)
                 continue
             else:
-                # Error non-transient (mis. permission, invalid range) -> jangan retry, lempar langsung
                 raise
 
-    # Semua percobaan retry habis, lempar error terakhir
     raise last_error
 
 
-def fetch_and_replace(export_url, params, tab_name, fixed_header=None):
-    print(f"--- Memproses {tab_name} ---")
+def fetch_export_data(job):
+    """
+    Tahap fetch (I/O-bound): token + download + parse ke DataFrame.
+    Dijalankan paralel untuk ke-3 tipe data.
 
-    response = requests.get(export_url, headers=HEADERS, params=params)
-    if response.status_code != 200:
-        print(f"❌ Error {response.status_code}: Gagal menarik data.")
-        # STANDAR LOG 1: FAILED (API)
-        update_cache_log(tab_name, f"Failed (API Error {response.status_code})")
-        return
-
-    df_fresh = pd.read_excel(io.BytesIO(response.content))
-    if df_fresh.empty:
-        print("⚠️ Tidak ada data baru untuk periode ini.\n")
-        # STANDAR LOG 2: SUCCESSFUL (KOSONG) - Tetap dicatat di Cache_Data
-        update_cache_log(tab_name, "Successful (No New Data)")
-        return
+    PENTING: fungsi ini TIDAK PERNAH melempar exception ke pemanggilnya.
+    Semua kegagalan (jaringan, HTTP, file excel korup, dsb.) ditangkap di sini
+    dan diubah jadi status string, supaya satu job yang gagal tidak
+    menggagalkan future.result() di thread utama dan menghentikan
+    pemrosesan ke-2 job lainnya.
+    """
+    tab_name = job["tab_name"]
+    print(f"--- Mengambil data {tab_name} ---")
 
     try:
-        worksheet = gc.open_by_key(SPREADSHEET_ID).worksheet(tab_name)
-    except gspread.exceptions.WorksheetNotFound:
-        print(f"❌ Tab '{tab_name}' tidak ditemukan di Google Sheets.\n")
-        # STANDAR LOG 3: FAILED (TAB HILANG)
-        update_cache_log(tab_name, "Failed (Schema Error - Tab Missing)")
-        return
+        token = get_fresh_export_token()
+        if not token:
+            print(f"❌ ERROR: Gagal mendapatkan token untuk {tab_name}. Bearer Token kemungkinan kedaluwarsa!")
+            return tab_name, None, "Failed (Token Expired)"
 
-    if fixed_header is not None:
-        # Header baku ditentukan secara eksplisit (mis. MTD_Fulfillment), tidak
-        # bergantung pada header yang saat ini ada di sheet.
-        existing_header = fixed_header
-    else:
-        # Ambil header yang sudah ada di baris pertama sheet, agar header selalu dipertahankan
-        existing_header = [h for h in worksheet.row_values(1) if h != ""]
+        params = dict(job["params"])
+        params["token"] = token
+        params["id"] = REQUEST_ID
 
-    if existing_header:
-        # Cocokkan kolom sumber (API) dengan header sheet berdasarkan NAMA, fleksibel terhadap
-        # perubahan urutan/jumlah kolom di sumber:
-        #  - Header yang namanya cocok dengan sumber -> diisi datanya
-        #  - Header yang tidak ada di sumber -> tetap ada di sheet, tapi datanya kosong
-        #  - Kolom sumber yang tidak ada di header -> diabaikan (tidak ditulis)
-        matched_cols = [c for c in existing_header if c in df_fresh.columns]
-        unmatched_cols = [c for c in existing_header if c not in df_fresh.columns]
-        if unmatched_cols:
-            print(f"ℹ️ Header tanpa kecocokan di sumber (dikosongkan): {unmatched_cols}")
-        print(f"Kolom tercocokkan: {len(matched_cols)}/{len(existing_header)}")
+        try:
+            response = HTTP_SESSION.get(EXPORT_URL, params=params, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.Timeout:
+            print(f"❌ Timeout saat mengambil {tab_name} (>{REQUEST_TIMEOUT}s).")
+            return tab_name, None, "Failed (Request Timeout)"
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Error koneksi saat mengambil {tab_name}: {e}")
+            return tab_name, None, "Failed (Connection Error)"
 
-        df_to_write = df_fresh.reindex(columns=existing_header)
-    else:
-        # Sheet/tab masih kosong -> pakai header dari sumber sebagai inisialisasi awal
-        print("Header sheet kosong, menggunakan header dari sumber sebagai inisialisasi.")
-        df_to_write = df_fresh
+        if response.status_code != 200:
+            print(f"❌ Error {response.status_code}: Gagal menarik data {tab_name}.")
+            return tab_name, None, f"Failed (API Error {response.status_code})"
 
-    # Bersihkan NaN/NaT/inf/Timestamp mentah sebelum dikirim ke Sheets API.
-    # Ini mencegah error [500] Internal error yang sering dipicu oleh nilai
-    # non-JSON-serializable (terutama pada kolom tanggal/jam yang banyak di MTD_Fulfillment).
-    df_to_write = sanitize_dataframe_for_sheets(df_to_write)
+        try:
+            df_fresh = pd.read_excel(io.BytesIO(response.content))
+        except Exception as e:
+            # File yang dikembalikan bukan Excel valid (mis. server balas HTML/JSON error
+            # walau status 200) -> jangan biarkan ini merusak seluruh pipeline.
+            print(f"❌ Gagal parse file Excel untuk {tab_name}: {e}")
+            return tab_name, None, "Failed (Invalid Excel Response)"
 
-    # Clear & paste, tapi header selalu dipertahankan/di-set ulang sesuai df_to_write.columns.
-    # Ditulis dengan retry supaya error transient Google Sheets API (500/502/503/429)
-    # tidak langsung menggagalkan seluruh pipeline.
+        if df_fresh.empty:
+            print(f"⚠️ Tidak ada data baru untuk {tab_name} pada periode ini.\n")
+            return tab_name, None, "Successful (No New Data)"
+
+        return tab_name, df_fresh, None
+
+    except Exception:
+        # Jaring pengaman terakhir: error tak terduga apa pun tidak boleh
+        # membuat thread ini melempar exception ke as_completed().
+        print(f"❌ Error tak terduga saat memproses {tab_name}:")
+        print(traceback.format_exc())
+        return tab_name, None, "Failed (Unexpected Error)"
+
+
+def write_to_sheet(tab_name, df_fresh, fixed_header):
+    """
+    Tahap write (Sheets API): cocokkan header, sanitize, tulis dengan retry.
+    Dibungkus try/except menyeluruh supaya kegagalan pada satu tab tidak
+    menghentikan loop dan mencegah tab-tab berikutnya diproses.
+    Return True/False untuk dipakai menghitung status akhir pipeline.
+    """
     try:
-        write_with_retry(worksheet, df_to_write)
-    except gspread.exceptions.APIError as e:
-        print(f"❌ Gagal menulis ke '{tab_name}' setelah beberapa percobaan: {e}\n")
-        update_cache_log(tab_name, "Failed (Sheets API Error After Retries)")
-        return
+        try:
+            worksheet = SPREADSHEET.worksheet(tab_name)
+        except gspread.exceptions.WorksheetNotFound:
+            print(f"❌ Tab '{tab_name}' tidak ditemukan di Google Sheets.\n")
+            update_cache_log(tab_name, "Failed (Schema Error - Tab Missing)")
+            return False
 
-    print(f"✅ Berhasil Diperbarui! Header dipertahankan, {len(df_to_write)} baris data ditulis.\n")
+        if fixed_header is not None:
+            existing_header = fixed_header
+        else:
+            existing_header = [h for h in worksheet.row_values(1) if h != ""]
 
-    # STANDAR LOG 5: SUCCESSFUL (Berhasil diproses)
-    update_cache_log(tab_name, "Successful")
+        if existing_header:
+            matched_cols = [c for c in existing_header if c in df_fresh.columns]
+            unmatched_cols = [c for c in existing_header if c not in df_fresh.columns]
+            if unmatched_cols:
+                print(f"ℹ️ Header tanpa kecocokan di sumber (dikosongkan): {unmatched_cols}")
+            print(f"Kolom tercocokkan: {len(matched_cols)}/{len(existing_header)}")
+
+            df_to_write = df_fresh.reindex(columns=existing_header)
+        else:
+            print("Header sheet kosong, menggunakan header dari sumber sebagai inisialisasi.")
+            df_to_write = df_fresh
+
+        df_to_write = sanitize_dataframe_for_sheets(df_to_write)
+
+        try:
+            write_with_retry(worksheet, df_to_write)
+        except gspread.exceptions.APIError as e:
+            print(f"❌ Gagal menulis ke '{tab_name}' setelah beberapa percobaan: {e}\n")
+            update_cache_log(tab_name, "Failed (Sheets API Error After Retries)")
+            return False
+
+        print(f"✅ Berhasil Diperbarui! Header dipertahankan, {len(df_to_write)} baris data ditulis.\n")
+        update_cache_log(tab_name, "Successful")
+        return True
+
+    except Exception:
+        print(f"❌ Error tak terduga saat menulis '{tab_name}':")
+        print(traceback.format_exc())
+        update_cache_log(tab_name, "Failed (Unexpected Error)")
+        return False
 
 
 # ==========================================
-# 4. EKSEKUSI PIPELINE (TOKEN-PER-REQUEST)
+# 4. EKSEKUSI PIPELINE
 # ==========================================
-export_url = "https://api.freshfactory.id/v1/admin/exports"
+def main():
+    # job_status melacak hasil akhir tiap tab untuk menentukan exit code di akhir.
+    # True = sukses (termasuk "no new data"), False = gagal.
+    job_status = {}
 
-# --- FULFILLMENT ---
-f_token = get_fresh_export_token()
-if f_token:
-    fetch_and_replace(export_url, {
-        "type": "fulfillment_detail", "warehouse_id": WAREHOUSE_ID, "tenant_id": TENANT_ID,
-        "start_order_date_in": start_date, "end_order_date_in": end_date,
-        "page": "1", "limit": "15", "token": f_token, "id": REQUEST_ID
-    }, "MTD_Fulfillment", fixed_header=FULFILLMENT_HEADER)
-else:
-    error_msg = "❌ ERROR: Gagal mendapatkan token Fulfillment. Bearer Token kemungkinan kedaluwarsa!"
-    print(error_msg)
-    update_cache_log("MTD_Fulfillment", "Failed (Token Expired)")
+    fetch_results = {}
+    with ThreadPoolExecutor(max_workers=len(JOBS)) as executor:
+        futures = {executor.submit(fetch_export_data, job): job for job in JOBS}
+        for future in as_completed(futures):
+            job = futures[future]
+            try:
+                tab_name, df, status = future.result()
+            except Exception:
+                # Seharusnya tidak pernah terjadi karena fetch_export_data sudah
+                # menangkap semua exception sendiri, tapi tetap dijaga di sini
+                # sebagai lapisan pertahanan terakhir.
+                tab_name = job["tab_name"]
+                print(f"❌ Error tak terduga dari thread fetch '{tab_name}':")
+                print(traceback.format_exc())
+                df, status = None, "Failed (Unexpected Thread Error)"
+            fetch_results[tab_name] = (df, status)
 
-# --- DELIVERY ---
-d_token = get_fresh_export_token()
-if d_token:
-    fetch_and_replace(export_url, {
-        "type": "delivery", "warehouseId": WAREHOUSE_ID, "tenantId": TENANT_ID,
-        "startDate": start_date, "endDate": end_date, "updateStatus": "false",
-        "token": d_token, "id": REQUEST_ID
-    }, "MTD_Delivery")
-else:
-    error_msg = "❌ ERROR: Gagal mendapatkan token Delivery. Bearer Token kemungkinan kedaluwarsa!"
-    print(error_msg)
-    update_cache_log("MTD_Delivery", "Failed (Token Expired)")
+    for job in JOBS:
+        tab_name = job["tab_name"]
+        df, status = fetch_results[tab_name]
 
-# --- RETURNS ---
-r_token = get_fresh_export_token()
-if r_token:
-    fetch_and_replace(export_url, {
-        "type": "return", "warehouseId": WAREHOUSE_ID, "tenantId": TENANT_ID,
-        "startDate": start_date, "endDate": end_date,
-        "token": r_token, "id": REQUEST_ID
-    }, "MTD_Returns", fixed_header=RETURNS_HEADER)
-else:
-    error_msg = "❌ ERROR: Gagal mendapatkan token Returns. Bearer Token kemungkinan kedaluwarsa!"
-    print(error_msg)
-    update_cache_log("MTD_Returns", "Failed (Token Expired)")
+        if status is not None:
+            update_cache_log(tab_name, status)
+            job_status[tab_name] = status.startswith("Successful")
+            continue
 
-print("🎉 SINKRONISASI TUNTAS 100%.")
+        job_status[tab_name] = write_to_sheet(tab_name, df, job["fixed_header"])
+
+    # ==========================================
+    # 5. RINGKASAN & EXIT CODE
+    # ==========================================
+    print("=" * 50)
+    print("📋 RINGKASAN EKSEKUSI:")
+    any_failed = False
+    for tab_name, ok in job_status.items():
+        icon = "✅" if ok else "❌"
+        print(f"  {icon} {tab_name}: {'Berhasil' if ok else 'Gagal'}")
+        if not ok:
+            any_failed = True
+    print("=" * 50)
+
+    if any_failed:
+        print("⚠️ SINKRONISASI SELESAI DENGAN KEGAGALAN PADA SATU ATAU LEBIH PIPELINE.")
+        sys.exit(1)  # Penting: exit code non-zero supaya GitHub Actions menandai run ini gagal
+    else:
+        print("🎉 SINKRONISASI TUNTAS 100%.")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        print("❌ FATAL: Error tak terduga menghentikan seluruh pipeline:")
+        print(traceback.format_exc())
+        sys.exit(1)
