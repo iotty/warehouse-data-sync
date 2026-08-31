@@ -29,7 +29,7 @@ TENANT_ID = "7b25e5bd-f47c-42ae-bf10-660e9fdbf78f"
 REQUEST_ID = "8d3ec4e2-50bb-47c4-a257-f1cc5e635ad1"
 
 HEADERS = {
-    "accept": "application/json", 
+    "accept": "application/json",
     "authorization": f"Bearer {bearer_token}",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
@@ -92,7 +92,7 @@ RETURNS_HEADER = [
 # ==========================================
 def get_fresh_export_token():
     url = "https://api.freshfactory.id/v1/admin/exports/generate_token"
-    for _ in range(3): 
+    for _ in range(3):
         try:
             response = requests.get(url, headers=HEADERS)
             if response.status_code == 200:
@@ -111,39 +111,107 @@ def update_cache_log(category_name, status_message):
             print("Membuat tab Cache_Data baru...")
             cache_sheet = spreadsheet.add_worksheet(title="Cache_Data", rows="100", cols="3")
             cache_sheet.append_row(["Kategori", "Terakhir Update (WIB)", "Status Eksekusi Terakhir"])
-        
+
         # Konversi waktu ke WIB (Waktu Indonesia Barat)
         wib_tz = pytz.timezone('Asia/Jakarta')
         current_time_wib = datetime.now(wib_tz).strftime('%Y-%m-%d %H:%M:%S')
-        
+
         # Cari baris yang sesuai dengan kategori
         existing_data = cache_sheet.get_all_values()
         row_index = -1
         for i, row in enumerate(existing_data):
             if row and row[0] == category_name:
-                row_index = i + 1 
+                row_index = i + 1
                 break
-                
+
         if row_index != -1:
             # Update baris yang ada
             cache_sheet.update(f'B{row_index}:C{row_index}', [[current_time_wib, status_message]])
         else:
             # Tambahkan baris baru jika belum ada
             cache_sheet.append_row([category_name, current_time_wib, status_message])
-            
+
     except Exception as e:
          print(f"⚠️ Peringatan: Gagal memperbarui Cache_Data: {e}")
 
+
+def sanitize_dataframe_for_sheets(df):
+    """
+    Bersihkan DataFrame agar aman ditulis ke Google Sheets API:
+    - NaN/NaT -> string kosong ('')
+    - inf/-inf -> string kosong ('')
+    - Timestamp/datetime -> string 'YYYY-MM-DD' atau 'YYYY-MM-DD HH:MM:SS'
+    - Semua kolom lain dipaksa jadi string agar tidak ada objek non-JSON-serializable
+      (Timestamp mentah dari pandas adalah penyebab umum error [500] saat set_with_dataframe)
+    """
+    df = df.copy()
+
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].apply(
+                lambda x: '' if pd.isna(x) else (
+                    x.strftime('%Y-%m-%d') if x.time() == datetime.min.time()
+                    else x.strftime('%Y-%m-%d %H:%M:%S')
+                )
+            )
+        else:
+            # Ganti inf/-inf jadi NaN dulu supaya tertangkap oleh fillna di bawah
+            df[col] = df[col].replace([float('inf'), float('-inf')], pd.NA)
+
+    # Ganti semua NaN/NaT/None yang tersisa jadi string kosong
+    df = df.fillna('')
+
+    # Paksa semua jadi string biar aman untuk JSON payload Sheets API
+    df = df.astype(str)
+    # astype(str) kadang menghasilkan literal 'nan'/'NaT'/'None' pada sel tertentu -> bersihkan
+    df = df.replace(['nan', 'NaT', 'None', '<NA>'], '')
+
+    return df
+
+
+def write_with_retry(worksheet, df_to_write, max_retries=4, base_delay=3):
+    """
+    Tulis DataFrame ke worksheet dengan retry + exponential backoff.
+    Menangani error transient Google Sheets API seperti [500] Internal error,
+    [502]/[503] Service Unavailable, dan [429] Rate Limit Exceeded.
+    """
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            worksheet.clear()
+            set_with_dataframe(worksheet, df_to_write)
+            return True
+        except gspread.exceptions.APIError as e:
+            last_error = e
+            status_code = None
+            try:
+                status_code = e.response.status_code
+            except Exception:
+                pass
+
+            if status_code in (500, 502, 503, 429):
+                delay = base_delay * (2 ** (attempt - 1))
+                print(f"⚠️ Percobaan {attempt}/{max_retries} gagal (HTTP {status_code}). Coba lagi dalam {delay}s...")
+                time.sleep(delay)
+                continue
+            else:
+                # Error non-transient (mis. permission, invalid range) -> jangan retry, lempar langsung
+                raise
+
+    # Semua percobaan retry habis, lempar error terakhir
+    raise last_error
+
+
 def fetch_and_replace(export_url, params, tab_name, fixed_header=None):
     print(f"--- Memproses {tab_name} ---")
-    
+
     response = requests.get(export_url, headers=HEADERS, params=params)
     if response.status_code != 200:
         print(f"❌ Error {response.status_code}: Gagal menarik data.")
         # STANDAR LOG 1: FAILED (API)
         update_cache_log(tab_name, f"Failed (API Error {response.status_code})")
         return
-        
+
     df_fresh = pd.read_excel(io.BytesIO(response.content))
     if df_fresh.empty:
         print("⚠️ Tidak ada data baru untuk periode ini.\n")
@@ -185,11 +253,23 @@ def fetch_and_replace(export_url, params, tab_name, fixed_header=None):
         print("Header sheet kosong, menggunakan header dari sumber sebagai inisialisasi.")
         df_to_write = df_fresh
 
-    # Clear & paste, tapi header selalu dipertahankan/di-set ulang sesuai df_to_write.columns
-    worksheet.clear()
-    set_with_dataframe(worksheet, df_to_write)
+    # Bersihkan NaN/NaT/inf/Timestamp mentah sebelum dikirim ke Sheets API.
+    # Ini mencegah error [500] Internal error yang sering dipicu oleh nilai
+    # non-JSON-serializable (terutama pada kolom tanggal/jam yang banyak di MTD_Fulfillment).
+    df_to_write = sanitize_dataframe_for_sheets(df_to_write)
+
+    # Clear & paste, tapi header selalu dipertahankan/di-set ulang sesuai df_to_write.columns.
+    # Ditulis dengan retry supaya error transient Google Sheets API (500/502/503/429)
+    # tidak langsung menggagalkan seluruh pipeline.
+    try:
+        write_with_retry(worksheet, df_to_write)
+    except gspread.exceptions.APIError as e:
+        print(f"❌ Gagal menulis ke '{tab_name}' setelah beberapa percobaan: {e}\n")
+        update_cache_log(tab_name, "Failed (Sheets API Error After Retries)")
+        return
+
     print(f"✅ Berhasil Diperbarui! Header dipertahankan, {len(df_to_write)} baris data ditulis.\n")
-    
+
     # STANDAR LOG 5: SUCCESSFUL (Berhasil diproses)
     update_cache_log(tab_name, "Successful")
 
