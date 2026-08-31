@@ -13,7 +13,10 @@ import pytz
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread_dataframe import set_with_dataframe
 
-REQUEST_TIMEOUT = 30  # detik, dipakai untuk semua panggilan HTTP (mencegah hang tanpa batas di CI)
+REQUEST_TIMEOUT = 30       # detik, untuk request ringan (token generation)
+EXPORT_TIMEOUT = 300       # detik, untuk download export biasa (5 menit)
+EXPORT_MAX_RETRIES = 3     # retry hanya untuk kegagalan NYATA (connection error / 5xx),
+                           # BUKAN untuk timeout murni -- lihat catatan di fetch_export_data()
 
 # ==========================================
 # 1. KONFIGURASI KEAMANAN & KREDENSIAL
@@ -157,6 +160,11 @@ JOBS = [
             "start_order_date_in": start_date, "end_order_date_in": end_date,
             "page": "1", "limit": "15",
         },
+        # fulfillment_detail = data level line-item (bukan level order), historisnya
+        # paling berat dari ketiga export ini -> kasih budget waktu jauh lebih besar
+        # (satu percobaan yang cukup lama, bukan beberapa percobaan pendek -- lihat catatan
+        # soal timeout-vs-retry di fetch_export_data()).
+        "timeout": 600,
     },
     {
         "tab_name": "MTD_Delivery",
@@ -165,6 +173,7 @@ JOBS = [
             "type": "delivery", "warehouseId": WAREHOUSE_ID, "tenantId": TENANT_ID,
             "startDate": start_date, "endDate": end_date, "updateStatus": "false",
         },
+        "timeout": EXPORT_TIMEOUT,
     },
     {
         "tab_name": "MTD_Returns",
@@ -173,6 +182,7 @@ JOBS = [
             "type": "return", "warehouseId": WAREHOUSE_ID, "tenantId": TENANT_ID,
             "startDate": start_date, "endDate": end_date,
         },
+        "timeout": EXPORT_TIMEOUT,
     },
 ]
 
@@ -324,42 +334,74 @@ def fetch_export_data(job):
     tab_name = job["tab_name"]
     print(f"--- Mengambil data {tab_name} ---")
 
+    timeout = job.get("timeout", EXPORT_TIMEOUT)
+
     try:
-        token = get_fresh_export_token()
-        if not token:
-            print(f"❌ ERROR: Gagal mendapatkan token untuk {tab_name}. Bearer Token kemungkinan kedaluwarsa!")
-            return tab_name, None, "Failed (Token Expired)"
+        last_status = None
 
-        params = dict(job["params"])
-        params["token"] = token
-        params["id"] = REQUEST_ID
+        for attempt in range(1, EXPORT_MAX_RETRIES + 1):
+            token = get_fresh_export_token()
+            if not token:
+                print(f"❌ ERROR: Gagal mendapatkan token untuk {tab_name}. Bearer Token kemungkinan kedaluwarsa!")
+                return tab_name, None, "Failed (Token Expired)"
 
-        try:
-            response = HTTP_SESSION.get(EXPORT_URL, params=params, timeout=REQUEST_TIMEOUT)
-        except requests.exceptions.Timeout:
-            print(f"❌ Timeout saat mengambil {tab_name} (>{REQUEST_TIMEOUT}s).")
-            return tab_name, None, "Failed (Request Timeout)"
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Error koneksi saat mengambil {tab_name}: {e}")
-            return tab_name, None, "Failed (Connection Error)"
+            params = dict(job["params"])
+            params["token"] = token
+            params["id"] = REQUEST_ID
 
-        if response.status_code != 200:
-            print(f"❌ Error {response.status_code}: Gagal menarik data {tab_name}.")
-            return tab_name, None, f"Failed (API Error {response.status_code})"
+            try:
+                # CATATAN PENTING: kalau endpoint export ini sifatnya SINKRON (server
+                # menahan koneksi sampai file selesai dibuat), maka setiap request baru
+                # = generation dimulai dari nol lagi. Meng-CATATkan itu:
+                # - Timeout murni (server belum sempat balas dalam batas waktu) TIDAK
+                #   diulang dengan request baru -- itu cuma akan me-restart proses
+                #   generation yang sama dan bisa membuatnya tidak akan pernah selesai
+                #   kalau generation memang butuh waktu lebih lama dari timeout.
+                #   Solusinya: kasih waktu tunggu yang cukup besar di SATU percobaan
+                #   (lihat EXPORT_TIMEOUT / override per-job di atas).
+                # - Connection error & HTTP 5xx BEDA -- itu tandanya request benar-benar
+                #   gagal/putus (bukan "masih diproses"), jadi tetap layak diulang.
+                response = HTTP_SESSION.get(EXPORT_URL, params=params, timeout=timeout)
+            except requests.exceptions.Timeout:
+                print(f"❌ Timeout saat mengambil {tab_name} setelah menunggu {timeout}s. "
+                      f"Tidak diulang otomatis (retry akan me-restart generation, bukan melanjutkan).")
+                return tab_name, None, "Failed (Request Timeout)"
+            except requests.exceptions.RequestException as e:
+                last_status = "Failed (Connection Error)"
+                print(f"⚠️ Error koneksi saat mengambil {tab_name} (percobaan {attempt}/{EXPORT_MAX_RETRIES}): {e}")
+            else:
+                if response.status_code != 200:
+                    last_status = f"Failed (API Error {response.status_code})"
+                    # 5xx dari server biasanya transient (server lagi overload) -> layak diulang.
+                    # 4xx (mis. bad request/unauthorized) tidak akan membaik dengan retry -> berhenti sekarang.
+                    if response.status_code < 500:
+                        print(f"❌ Error {response.status_code}: Gagal menarik data {tab_name} (tidak akan diulang).")
+                        return tab_name, None, last_status
+                    print(f"⚠️ Error {response.status_code} saat mengambil {tab_name} (percobaan {attempt}/{EXPORT_MAX_RETRIES}).")
+                else:
+                    try:
+                        df_fresh = pd.read_excel(io.BytesIO(response.content))
+                    except Exception as e:
+                        # File bukan Excel valid (mis. server balas HTML/JSON error walau status 200).
+                        # Tidak akan membaik dengan retry -> berhenti sekarang.
+                        print(f"❌ Gagal parse file Excel untuk {tab_name}: {e}")
+                        return tab_name, None, "Failed (Invalid Excel Response)"
 
-        try:
-            df_fresh = pd.read_excel(io.BytesIO(response.content))
-        except Exception as e:
-            # File yang dikembalikan bukan Excel valid (mis. server balas HTML/JSON error
-            # walau status 200) -> jangan biarkan ini merusak seluruh pipeline.
-            print(f"❌ Gagal parse file Excel untuk {tab_name}: {e}")
-            return tab_name, None, "Failed (Invalid Excel Response)"
+                    if df_fresh.empty:
+                        print(f"⚠️ Tidak ada data baru untuk {tab_name} pada periode ini.\n")
+                        return tab_name, None, "Successful (No New Data)"
 
-        if df_fresh.empty:
-            print(f"⚠️ Tidak ada data baru untuk {tab_name} pada periode ini.\n")
-            return tab_name, None, "Successful (No New Data)"
+                    return tab_name, df_fresh, None
 
-        return tab_name, df_fresh, None
+            # Titik ini hanya tercapai untuk connection error / 5xx (kegagalan nyata),
+            # timeout murni sudah return duluan di atas.
+            if attempt < EXPORT_MAX_RETRIES:
+                delay = 5 * attempt
+                print(f"   Coba lagi dalam {delay}s...")
+                time.sleep(delay)
+
+        print(f"❌ Gagal mengambil {tab_name} setelah {EXPORT_MAX_RETRIES} percobaan.")
+        return tab_name, None, last_status or "Failed (Unknown Error)"
 
     except Exception:
         # Jaring pengaman terakhir: error tak terduga apa pun tidak boleh
