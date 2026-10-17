@@ -1,4 +1,4 @@
-name: Data Sync Pipeline (Fresh Factory to Google Sheets)
+name: Data Sync Pipeline (WMS to Google Sheets)
 
 on:
   workflow_dispatch:
@@ -8,19 +8,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ambil Kode dari Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Siapkan Environment Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Install Pustaka (Library)
         run: pip install -r requirements.txt
 
       - name: Jalankan Skrip Upsert Harian
         env:
-          # Memanggil data rahasia dari tab Settings > Secrets
+          # Memanggil seluruh kredensial & konfigurasi dari Settings > Secrets and variables > Actions
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          WAREHOUSE_ID: ${{ secrets.WAREHOUSE_ID }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+          REQUEST_ID: ${{ secrets.REQUEST_ID }}
+          API_EXPORT_URL: ${{ secrets.API_EXPORT_URL }}
+          API_TOKEN_URL: ${{ secrets.API_TOKEN_URL }}
+          VENDOR_INITIALS: ${{ secrets.VENDOR_INITIALS }}
         run: python main.py
