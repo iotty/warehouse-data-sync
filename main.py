@@ -18,6 +18,8 @@ EXPORT_TIMEOUT = 300       # detik, untuk download export biasa (5 menit)
 EXPORT_MAX_RETRIES = 3     # retry hanya untuk kegagalan NYATA (connection error / 5xx),
                            # BUKAN untuk timeout murni -- lihat catatan di fetch_export_data()
 
+WIB_TZ = pytz.timezone('Asia/Jakarta')
+
 # ==========================================
 # 1. KONFIGURASI KEAMANAN & KREDENSIAL
 # ==========================================
@@ -35,6 +37,7 @@ def load_config():
         "REQUEST_ID",
         "API_EXPORT_URL",
         "API_TOKEN_URL",
+        "VENDOR_INITIALS",
     ]
 
     config = {}
@@ -80,6 +83,7 @@ TENANT_ID = CONFIG["TENANT_ID"]
 REQUEST_ID = CONFIG["REQUEST_ID"]
 EXPORT_URL = CONFIG["API_EXPORT_URL"]
 TOKEN_URL = CONFIG["API_TOKEN_URL"]
+VENDOR_TAG = CONFIG["VENDOR_INITIALS"]
 
 HEADERS = {
     "accept": "application/json",
@@ -106,7 +110,7 @@ HTTP_SESSION.headers.update(HEADERS)
 # ==========================================
 # 2. LOGIKA ROLLING WINDOW (1 Bulan Lalu - Besok)
 # ==========================================
-today = datetime.now()
+today = datetime.now(WIB_TZ)
 end_date = (today + timedelta(days=1)).strftime('%Y-%m-%d')
 
 first_day_this_month = today.replace(day=1)
@@ -126,8 +130,8 @@ FULFILLMENT_HEADER = [
     "Estimasi Volume (cm3)", "Jumlah Koli", "Metode Pengantaran", "Kurir Pengantaran",
     "Tipe Pengantaran", "Nomor AWB", "Nama Kurir", "Tanggal Perkiraan Pickup",
     "Jam Perkiraan Pickup", "Status Fulfillment", "Alasan Fulfillment",
-    "Tingkat Layanan Fulfillment", "Tanggal Fulfillment Masuk WMS",
-    "Jam Fulfillment Masuk WMS", "Tanggal Fulfillment Allocated",
+    "Tingkat Layanan Fulfillment", f"Tanggal Fulfillment Masuk {VENDOR_TAG}",
+    f"Jam Fulfillment Masuk {VENDOR_TAG}", "Tanggal Fulfillment Allocated",
     "Jam Fulfillment Allocated", "Tanggal Batas Waktu", "Jam Batas Waktu",
     "Tanggal Proses Fulfillment", "Jam Proses Fulfillment", "Nama LM yang Proses",
     "Tanggal Fulfillment Menunggu Diambil", "Jam Fulfillment Menunggu Diambil",
@@ -230,8 +234,7 @@ def update_cache_log(category_name, status_message):
             cache_sheet = SPREADSHEET.add_worksheet(title="Cache_Data", rows="100", cols="3")
             cache_sheet.append_row(["Kategori", "Terakhir Update (WIB)", "Status Eksekusi Terakhir"])
 
-        wib_tz = pytz.timezone('Asia/Jakarta')
-        current_time_wib = datetime.now(wib_tz).strftime('%Y-%m-%d %H:%M:%S')
+        current_time_wib = datetime.now(WIB_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
         try:
             cell = cache_sheet.find(category_name, in_column=1)
@@ -389,7 +392,7 @@ def write_to_sheet(tab_name, df_raw, fixed_header):
             matched_cols = [c for c in existing_header if c in df_raw.columns]
             unmatched_cols = [c for c in existing_header if c not in df_raw.columns]
             if unmatched_cols:
-                print(f"ℹ️ Header tanpa kecocokan di sumber (dikosongkan): {unmatched_cols}")
+                print(f"ℹ️ Header tanpa kecocokan di sumber (dikosongkan): {len(unmatched_cols)} kolom")
             print(f"Kolom tercocokkan: {len(matched_cols)}/{len(existing_header)}")
 
             df_to_write = df_raw.reindex(columns=existing_header)
